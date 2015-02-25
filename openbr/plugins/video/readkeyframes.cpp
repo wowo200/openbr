@@ -43,12 +43,13 @@ public:
         avSwsCtx = NULL;
         avCodec = NULL;
         frame = NULL;
-        bgr_frame = NULL;
+        cvt_frame = NULL;
         buffer = NULL;
         opened = false;
         streamID = -1;
         fps = 0.f;
         time_base = 0.f;
+        format = 1;
         timeIdx = -1;
         filename = QString();
     }
@@ -58,10 +59,10 @@ public:
         init();
     }
 
-    AVCapture(const QString filename)
+    AVCapture(const QString filename, const int mode)
     {
         init();
-        opened = open(filename);
+        opened = open(filename, mode);
     }
 
     ~AVCapture()
@@ -69,9 +70,11 @@ public:
         release();
     }
 
-    bool open(const QString url)
+    bool open(const QString url, const int mode)
     {
         filename = url;
+        format = mode;
+        AVPixelFormat pixFmt = mode ? AV_PIX_FMT_BGR24 : AV_PIX_FMT_GRAY8;
         if (opened) release();
         if (avformat_open_input(&avFormatCtx, filename.toStdString().c_str(), NULL, NULL) != 0) {
             qFatal("Failed to open %s for reading.", qPrintable(filename));
@@ -98,21 +101,21 @@ public:
             qFatal("Could not open codec for file %s", qPrintable(filename));
 
         frame = av_frame_alloc();
-        bgr_frame = av_frame_alloc();
+        cvt_frame = av_frame_alloc();
 
         // Get fps, stream time_base and allocate space for frame buffer with av_malloc.
         fps = (float)avFormatCtx->streams[streamID]->avg_frame_rate.num /
               (float)avFormatCtx->streams[streamID]->avg_frame_rate.den;
         time_base = (float)avFormatCtx->streams[streamID]->time_base.num /
                     (float)avFormatCtx->streams[streamID]->time_base.den;
-        int framebytes = avpicture_get_size(AV_PIX_FMT_BGR24, avCodecCtx->width, avCodecCtx->height);
+        int framebytes = avpicture_get_size(pixFmt, avCodecCtx->width, avCodecCtx->height);
         buffer = (uint8_t*)av_malloc(framebytes*sizeof(uint8_t));
-        avpicture_fill((AVPicture*)bgr_frame, buffer, AV_PIX_FMT_BGR24, avCodecCtx->width, avCodecCtx->height);
+        avpicture_fill((AVPicture*)cvt_frame, buffer, pixFmt, avCodecCtx->width, avCodecCtx->height);
 
         avSwsCtx = sws_getContext(avCodecCtx->width, avCodecCtx->height,
                                   avCodecCtx->pix_fmt,
                                   avCodecCtx->width, avCodecCtx->height,
-                                  AV_PIX_FMT_BGR24,
+                                  pixFmt,
                                   SWS_BICUBIC,
                                   NULL, NULL, NULL);
 
@@ -148,7 +151,7 @@ public:
     {
         if (avSwsCtx)     sws_freeContext(avSwsCtx);
         if (frame)        av_free(frame);
-        if (bgr_frame)    av_free(bgr_frame);
+        if (cvt_frame)    av_free(cvt_frame);
         if (avCodecCtx)   avcodec_close(avCodecCtx);
         if (avFormatCtx)  avformat_close_input(&avFormatCtx);
         if (buffer)       av_free(buffer);
@@ -176,15 +179,16 @@ public:
             }
         }
 
-        // Convert from native format to BGR
+        // Convert from native format
         sws_scale(avSwsCtx,
                   frame->data,
                   frame->linesize,
                   0, avCodecCtx->height,
-                  bgr_frame->data,
-                  bgr_frame->linesize);
+                  cvt_frame->data,
+                  cvt_frame->linesize);
 
-        image = Mat(avCodecCtx->height, avCodecCtx->width, CV_8UC3, bgr_frame->data[0]);
+        // Write AVFrame to cv::Mat
+        image = Mat(avCodecCtx->height, avCodecCtx->width, format ? CV_8UC3 : CV_8UC1, cvt_frame->data[0]);
         if (image.data) {
             if (av_seek_frame(avFormatCtx, streamID, timeIdx+1, 0) < 0)
                 opened = false;
@@ -201,12 +205,13 @@ private:
     SwsContext *avSwsCtx;
     AVCodec *avCodec;
     AVFrame *frame;
-    AVFrame *bgr_frame;
+    AVFrame *cvt_frame;
     uint8_t *buffer;
     bool opened;
     int streamID;
     float fps;
     float time_base;
+    int format;
     int64_t timeIdx;
     QString filename;
 };
@@ -219,18 +224,29 @@ private:
 class ReadKeyframesTransform : public UntrainableMetaTransform
 {
     Q_OBJECT
+    Q_ENUMS(Mode)
+    Q_PROPERTY(Mode mode READ get_mode WRITE set_mode RESET reset_mode)
+
+public:
+    enum Mode
+    {
+        Grayscale = 0,
+        Color     = 1
+    };
+
 private:
+    BR_PROPERTY(Mode, mode, Color)
 
     void project(const Template &src, Template &dst) const
     {
         (void) src; (void) dst;
-        qFatal("ReadVideoTransform does not support single template project!");
+        qFatal("ReadKeyframesTransform does not support single template project!");
     }
 
     void project(const TemplateList &srcList, TemplateList &dstList) const
     {
         foreach(const Template &src, srcList) {
-            AVCapture cap(src.file.name);
+            AVCapture cap(src.file.name, mode);
             bool opened = cap.isOpened();
             QString URL = src.file.get<QString>("URL", "");
             float fps = cap.getFPS();
@@ -242,6 +258,7 @@ private:
                 if (temp.data) {
                     Template dst(temp.clone());
                     dst.file = src.file;
+                    // Append timestamp to URL
                     dst.file.set("URL", URL + "#t=" + QString::number((int)(currentFrame/fps)) + "s");
                     dst.file.set("FrameNumber", QString::number(currentFrame));
                     dstList.append(dst);
